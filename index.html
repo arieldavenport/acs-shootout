@@ -101,8 +101,8 @@ function sfxHighScore() {
 }
 
 // ---- GAME STATE ----
-const STATE = { TITLE: 0, READY: 1, PLAYING: 2, AIMING: 3, SHOOTING: 4, RESULT: 5, GAMEOVER: 6, LEADERBOARD: 7, INITIALS: 8 };
-let state = STATE.TITLE;
+const STATE = { DISCLAIMER: 9, TITLE: 0, READY: 1, PLAYING: 2, AIMING: 3, SHOOTING: 4, RESULT: 5, GAMEOVER: 6, LEADERBOARD: 7, INITIALS: 8 };
+let state = sessionStorage.getItem('acs_disclaimer_ok') ? STATE.TITLE : STATE.DISCLAIMER;
 let stateTimer = 0;
 
 // Rack positions (5 racks around the arc, left to right)
@@ -376,6 +376,16 @@ function update(dt) {
 
   let inp;
   switch (state) {
+    case STATE.DISCLAIMER:
+      inp = processInput();
+      if (inp === 'click' && stateTimer > 0.5) {
+        sessionStorage.setItem('acs_disclaimer_ok', '1');
+        state = STATE.TITLE;
+        stateTimer = 0;
+        sfxSelect();
+      }
+      break;
+
     case STATE.TITLE:
       inp = processInput();
       if (inp === 'click') {
@@ -835,6 +845,40 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
+// ---- DRAW DISCLAIMER SCREEN ----
+function drawDisclaimer() {
+  drawPixelRect(0, 0, BASE_W, BASE_H, COL.black);
+
+  // Border box
+  drawPixelRect(60, 50, 520, 380, COL.red);
+  drawPixelRect(64, 54, 512, 372, COL.black);
+  drawPixelRect(60, 46, 520, 3, COL.white);
+  drawPixelRect(60, 431, 520, 3, COL.white);
+
+  // Warning icon
+  drawPixelText('! WARNING !', 320, 90, 14, COL.red);
+
+  drawPixelRect(140, 115, 360, 2, COL.darkGray);
+
+  // Message lines
+  drawPixelText('BY CONTINUING', 320, 155, 8, COL.white);
+  drawPixelText('I PROMISE THAT', 320, 185, 8, COL.white);
+  drawPixelText('I AM NOT PLAYING', 320, 215, 8, COL.gold);
+  drawPixelText('THIS DURING CLASS', 320, 245, 8, COL.gold);
+  drawPixelText('OR WITHOUT', 320, 275, 8, COL.gold);
+  drawPixelText('PERMISSION', 320, 305, 8, COL.gold);
+
+  drawPixelRect(140, 330, 360, 2, COL.darkGray);
+
+  // Blink prompt
+  if (stateTimer > 0.5 && Math.floor(stateTimer * 2.5) % 2 === 0) {
+    drawPixelText('TAP TO AGREE', 320, 365, 8, COL.green);
+  }
+
+  // Footer
+  drawPixelText('PLAY RESPONSIBLY', 320, 410, 5, COL.darkGray);
+}
+
 // ---- DRAW TITLE SCREEN ----
 function drawTitle() {
   drawPixelRect(0, 0, BASE_W, BASE_H, COL.black);
@@ -1036,6 +1080,9 @@ function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   switch (state) {
+    case STATE.DISCLAIMER:
+      drawDisclaimer();
+      break;
     case STATE.TITLE:
       drawTitle();
       break;
