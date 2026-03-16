@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACS Shootout</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Press Start 2P', monospace;
+    overflow: hidden;
+    image-rendering: pixelated;
+  }
+
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+//  ACS SHOOTOUT — Retro 3-Point Contest
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Responsive sizing
+const BASE_W = 640, BASE_H = 480;
+let scale = 1;
+function resize() {
+  scale = Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H);
+  scale = Math.max(1, Math.floor(scale)) || 1;
+  canvas.width = BASE_W * scale;
+  canvas.height = BASE_H * scale;
+  ctx.imageSmoothingEnabled = false;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ---- COLORS ----
+const COL = {
+  bg: '#1a1a1a',
+  court: '#8B4513',
+  courtLine: '#FFFFFF',
+  paint: '#CC0000',
+  red: '#CC0000',
+  white: '#FFFFFF',
+  black: '#111111',
+  gold: '#FFD700',
+  gray: '#888888',
+  darkGray: '#444444',
+  green: '#00CC44',
+  hud: '#222222',
+  net: '#EEEEEE',
+  ball: '#FF6600',
+  ballDark: '#CC4400',
+  rim: '#CC0000',
+  backboard: '#FFFFFF',
+  shadow: 'rgba(0,0,0,0.4)',
+};
+
+// ---- AUDIO (web audio synth) ----
+let audioCtx;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playTone(freq, dur, type = 'square', vol = 0.1) {
+  ensureAudio();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.value = vol;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sfxShoot() { playTone(220, 0.15, 'square', 0.08); }
+function sfxSwish() { playTone(880, 0.12, 'square', 0.1); playTone(1100, 0.15, 'sine', 0.06); }
+function sfxMiss() { playTone(110, 0.2, 'sawtooth', 0.06); }
+function sfxRack() { playTone(440, 0.08); setTimeout(() => playTone(660, 0.08), 80); }
+function sfxBuzzer() { playTone(200, 0.6, 'sawtooth', 0.15); }
+function sfxSelect() { playTone(520, 0.06); }
+function sfxHighScore() {
+  [440,554,659,880].forEach((f,i) => setTimeout(() => playTone(f, 0.2, 'square', 0.1), i*150));
+}
+
+// ---- GAME STATE ----
+const STATE = { TITLE: 0, READY: 1, PLAYING: 2, AIMING: 3, SHOOTING: 4, RESULT: 5, GAMEOVER: 6, LEADERBOARD: 7, INITIALS: 8 };
+let state = STATE.TITLE;
+let stateTimer = 0;
+
+// Rack positions (5 racks around the arc, left to right)
+// Court is drawn top-down; basket at top center
+const BASKET = { x: 320, y: 100 };
+const RACKS = [
+  { x: 105, y: 310, label: 'L Corner' },
+  { x: 140, y: 230, label: 'L Wing' },
+  { x: 320, y: 195, label: 'Top' },
+  { x: 500, y: 230, label: 'R Wing' },
+  { x: 535, y: 310, label: 'R Corner' },
+];
+
+let currentRack = 0;
+let currentBall = 0;       // 0-4 per rack
+let score = 0;
+let timeLeft = 60.0;       // 60 second contest
+let lastTime = 0;
+
+// Per-rack results: array of 5 arrays, each ball = null / 'hit' / 'miss'
+let rackResults = [];
+
+// Timing mechanic
+let meterAngle = 0;        // 0..2PI rotating meter
+let meterSpeed = 4.5;      // radians per second
+let meterStopped = false;
+let meterStopAngle = 0;
+let sweetSpotCenter = Math.PI;   // top of meter = sweet spot
+let sweetSpotHalf = 0.35;        // radians half-width for "swish"
+let goodZoneHalf = 0.7;          // wider zone for "make"
+
+// Ball flight animation
+let ballAnim = null; // { x, y, targetX, targetY, t, duration, made, arc }
+
+// Flash messages
+let flashMsg = '';
+let flashTimer = 0;
+let flashColor = COL.white;
+
+// Stars / confetti for celebration
+let particles = [];
+
+// Leaderboard
+let leaderboard = loadLeaderboard();
+let initialsEntry = ['A','A','A'];
+let initialsPos = 0;
+let pendingScore = 0;
+
+// Title animation
+let titleBlink = 0;
+
+// ---- LEADERBOARD PERSISTENCE (API + localStorage fallback) ----
+let _lastSubmitTime = 0;
+const _SUBMIT_COOLDOWN = 3000; // 3 seconds rate limit
+
+function loadLeaderboard() {
+  // Load cached data from localStorage immediately
+  let cached = [];
+  try {
+    const data = JSON.parse(localStorage.getItem('acs_shootout_lb'));
+    if (Array.isArray(data)) cached = data.slice(0, 10);
+  } catch(e) {}
+  // Fetch from API in background and update
+  fetch('/api/leaderboard')
+    .then(r => r.json())
+    .then(data => {
+      if (Array.isArray(data)) {
+        leaderboard = data.slice(0, 10);
+        localStorage.setItem('acs_shootout_lb', JSON.stringify(leaderboard));
+      }
+    })
+    .catch(() => {}); // silently use cached on failure
+  return cached;
+}
+function saveLeaderboard() {
+  // No-op: saving happens server-side via insertScore
+}
+function isHighScore(s) {
+  if (leaderboard.length < 10) return true;
+  return s > leaderboard[leaderboard.length - 1].score;
+}
+function insertScore(initials, s) {
+  // Optimistic local update
+  leaderboard.push({ name: initials, score: s });
+  leaderboard.sort((a,b) => b.score - a.score);
+  leaderboard = leaderboard.slice(0, 10);
+  localStorage.setItem('acs_shootout_lb', JSON.stringify(leaderboard));
+
+  // Client-side rate limiting
+  const now = Date.now();
+  if (now - _lastSubmitTime < _SUBMIT_COOLDOWN) return;
+  _lastSubmitTime = now;
+
+  // POST to API
+  fetch('/api/leaderboard', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: initials, score: s })
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (Array.isArray(data)) {
+        leaderboard = data.slice(0, 10);
+        localStorage.setItem('acs_shootout_lb', JSON.stringify(leaderboard));
+      }
+    })
+    .catch(() => {}); // keep optimistic local update on failure
+}
+
+// ---- INIT GAME ----
+function initGame() {
+  currentRack = 0;
+  currentBall = 0;
+  score = 0;
+  timeLeft = 60.0;
+  rackResults = RACKS.map(() => [null, null, null, null, null]);
+  meterAngle = 0;
+  meterStopped = false;
+  ballAnim = null;
+  flashMsg = '';
+  flashTimer = 0;
+  particles = [];
+}
+
+// ---- IS MONEY BALL ----
+function isMoneyBall(ball) { return ball === 4; }
+function ballPoints(ball) { return isMoneyBall(ball) ? 2 : 1; }
+
+// ---- SHOOTING LOGIC ----
+function attemptShot() {
+  meterStopped = true;
+  meterStopAngle = meterAngle;
+  sfxShoot();
+
+  // Determine accuracy
+  let diff = Math.abs(angleDiff(meterStopAngle, sweetSpotCenter));
+  let made = false;
+  if (diff <= sweetSpotHalf) {
+    made = true; // perfect
+  } else if (diff <= goodZoneHalf) {
+    // partial chance — closer = higher chance
+    let chance = 1.0 - ((diff - sweetSpotHalf) / (goodZoneHalf - sweetSpotHalf));
+    made = Math.random() < chance * 0.7 + 0.15;
+  } else {
+    // outside good zone — small chance
+    made = Math.random() < 0.08;
+  }
+
+  // Animate ball
+  const rack = RACKS[currentRack];
+  const dur = 0.55;
+  ballAnim = {
+    sx: rack.x, sy: rack.y,
+    tx: BASKET.x + (Math.random() * 10 - 5),
+    ty: BASKET.y,
+    t: 0, duration: dur,
+    made: made,
+    peakY: Math.min(rack.y, BASKET.y) - 80 - Math.random() * 20,
+  };
+
+  state = STATE.SHOOTING;
+}
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+function finishShot() {
+  const made = ballAnim.made;
+  const pts = ballPoints(currentBall);
+  rackResults[currentRack][currentBall] = made ? 'hit' : 'miss';
+
+  if (made) {
+    score += pts;
+    sfxSwish();
+    flashMsg = pts === 2 ? 'MONEY BALL! +2' : 'SWISH! +1';
+    flashColor = pts === 2 ? COL.gold : COL.green;
+    // Particles
+    for (let i = 0; i < (pts === 2 ? 12 : 6); i++) {
+      particles.push({
+        x: BASKET.x, y: BASKET.y,
+        vx: (Math.random() - 0.5) * 3,
+        vy: -Math.random() * 3 - 1,
+        life: 0.6 + Math.random() * 0.4,
+        color: pts === 2 ? COL.gold : COL.white,
+        size: 2 + Math.random() * 2,
+      });
+    }
+  } else {
+    sfxMiss();
+    flashMsg = 'MISS';
+    flashColor = COL.gray;
+  }
+  flashTimer = 0.8;
+  ballAnim = null;
+
+  // Advance
+  currentBall++;
+  if (currentBall >= 5) {
+    currentBall = 0;
+    currentRack++;
+    if (currentRack >= 5) {
+      // Game over
+      state = STATE.GAMEOVER;
+      stateTimer = 0;
+      sfxBuzzer();
+      return;
+    }
+    sfxRack();
+    flashMsg = RACKS[currentRack].label.toUpperCase();
+    flashColor = COL.white;
+    flashTimer = 1.0;
+  }
+
+  meterAngle = 0;
+  meterStopped = false;
+  state = STATE.AIMING;
+}
+
+// ---- INPUT ----
+let inputQueue = [];
+canvas.addEventListener('click', (e) => { ensureAudio(); inputQueue.push('click'); });
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); ensureAudio(); inputQueue.push('click'); }, { passive: false });
+document.addEventListener('keydown', (e) => {
+  ensureAudio();
+  if (state === STATE.INITIALS) {
+    if (e.key === 'ArrowUp') inputQueue.push('up');
+    else if (e.key === 'ArrowDown') inputQueue.push('down');
+    else if (e.key === 'ArrowLeft') inputQueue.push('left');
+    else if (e.key === 'ArrowRight' || e.key === 'Enter') inputQueue.push('right');
+    else if (e.key === ' ') inputQueue.push('click');
+    else if (e.key.length === 1 && /[A-Za-z]/.test(e.key)) {
+      initialsEntry[initialsPos] = e.key.toUpperCase();
+      if (initialsPos < 2) initialsPos++;
+      sfxSelect();
+    }
+    else if (e.key === 'Backspace') {
+      if (initialsPos > 0) initialsPos--;
+      sfxSelect();
+    }
+  } else {
+    if (e.key === ' ' || e.key === 'Enter') inputQueue.push('click');
+  }
+});
+
+function processInput() {
+  const inp = inputQueue.shift();
+  if (!inp) return null;
+  return inp;
+}
+
+// ---- UPDATE ----
+function update(dt) {
+  stateTimer += dt;
+  titleBlink += dt;
+
+  // Update particles
+  particles.forEach(p => {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 5 * dt;
+    p.life -= dt;
+  });
+  particles = particles.filter(p => p.life > 0);
+
+  // Flash
+  if (flashTimer > 0) flashTimer -= dt;
+
+  let inp;
+  switch (state) {
+    case STATE.TITLE:
+      inp = processInput();
+      if (inp === 'click') {
+        state = STATE.READY;
+        stateTimer = 0;
+        initGame();
+        sfxSelect();
+      }
+      break;
+
+    case STATE.READY:
+      inp = processInput();
+      if (inp === 'click') {
+        state = STATE.AIMING;
+        stateTimer = 0;
+        lastTime = performance.now();
+        flashMsg = RACKS[0].label.toUpperCase();
+        flashColor = COL.white;
+        flashTimer = 1.0;
+        sfxRack();
+      }
+      break;
+
+    case STATE.AIMING:
+      // Timer
+      timeLeft -= dt;
+      if (timeLeft <= 0) {
+        timeLeft = 0;
+        state = STATE.GAMEOVER;
+        stateTimer = 0;
+        sfxBuzzer();
+        break;
+      }
+      // Meter
+      meterAngle += meterSpeed * dt;
+      if (meterAngle > 2 * Math.PI) meterAngle -= 2 * Math.PI;
+      // Speed increases slightly each rack
+      meterSpeed = 4.5 + currentRack * 0.6;
+
+      inp = processInput();
+      if (inp === 'click') {
+        attemptShot();
+      }
+      break;
+
+    case STATE.SHOOTING:
+      timeLeft -= dt;
+      if (timeLeft <= 0) timeLeft = 0;
+
+      if (ballAnim) {
+        ballAnim.t += dt;
+        if (ballAnim.t >= ballAnim.duration) {
+          finishShot();
+        }
+      }
+      // drain input
+      processInput();
+      break;
+
+    case STATE.GAMEOVER:
+      if (stateTimer > 1.5) {
+        inp = processInput();
+        if (inp === 'click') {
+          if (isHighScore(score)) {
+            state = STATE.INITIALS;
+            stateTimer = 0;
+            initialsEntry = ['A','A','A'];
+            initialsPos = 0;
+            pendingScore = score;
+            sfxHighScore();
+          } else {
+            state = STATE.LEADERBOARD;
+            stateTimer = 0;
+          }
+        }
+      }
+      break;
+
+    case STATE.INITIALS:
+      inp = processInput();
+      if (inp === 'up') {
+        let c = initialsEntry[initialsPos].charCodeAt(0);
+        c++; if (c > 90) c = 65;
+        initialsEntry[initialsPos] = String.fromCharCode(c);
+        sfxSelect();
+      } else if (inp === 'down') {
+        let c = initialsEntry[initialsPos].charCodeAt(0);
+        c--; if (c < 65) c = 90;
+        initialsEntry[initialsPos] = String.fromCharCode(c);
+        sfxSelect();
+      } else if (inp === 'right') {
+        if (initialsPos < 2) {
+          initialsPos++;
+          sfxSelect();
+        } else {
+          // Confirm
+          insertScore(initialsEntry.join(''), pendingScore);
+          state = STATE.LEADERBOARD;
+          stateTimer = 0;
+          sfxSelect();
+        }
+      } else if (inp === 'left') {
+        if (initialsPos > 0) { initialsPos--; sfxSelect(); }
+      } else if (inp === 'click') {
+        if (initialsPos < 2) {
+          initialsPos++;
+          sfxSelect();
+        } else {
+          insertScore(initialsEntry.join(''), pendingScore);
+          state = STATE.LEADERBOARD;
+          stateTimer = 0;
+          sfxSelect();
+        }
+      }
+      break;
+
+    case STATE.LEADERBOARD:
+      inp = processInput();
+      if (inp === 'click' && stateTimer > 0.5) {
+        state = STATE.TITLE;
+        stateTimer = 0;
+      }
+      break;
+  }
+}
+
+// ---- DRAW HELPERS ----
+function px(x) { return Math.floor(x * scale); }
+
+function drawPixelRect(x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(px(x), px(y), px(w), px(h));
+}
+
+function drawPixelText(text, x, y, size, color, align = 'center') {
+  ctx.fillStyle = color;
+  ctx.font = `${px(size)}px 'Press Start 2P', monospace`;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, px(x), px(y));
+}
+
+function drawPixelCircle(cx_, cy_, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(px(cx_), px(cy_), px(r), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawPixelRing(cx_, cy_, r, color, lw = 2) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = px(lw);
+  ctx.beginPath();
+  ctx.arc(px(cx_), px(cy_), px(r), 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+// ---- DRAW COURT (top-down retro view) ----
+function drawCourt() {
+  // Floor
+  drawPixelRect(0, 0, BASE_W, BASE_H, COL.bg);
+
+  // Court surface
+  drawPixelRect(40, 40, 560, 350, COL.court);
+
+  // Paint / key area
+  drawPixelRect(250, 40, 140, 120, COL.paint);
+  ctx.strokeStyle = COL.courtLine;
+  ctx.lineWidth = px(2);
+  ctx.strokeRect(px(250), px(40), px(140), px(120));
+
+  // Free throw circle
+  drawPixelRing(320, 160, 40, COL.courtLine, 2);
+
+  // Three-point arc
+  ctx.strokeStyle = COL.courtLine;
+  ctx.lineWidth = px(2);
+  ctx.beginPath();
+  // Corner lines
+  ctx.moveTo(px(95), px(40));
+  ctx.lineTo(px(95), px(190));
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(px(545), px(40));
+  ctx.lineTo(px(545), px(190));
+  ctx.stroke();
+  // Arc
+  ctx.beginPath();
+  ctx.arc(px(320), px(100), px(225), 0.38, Math.PI - 0.38);
+  ctx.stroke();
+
+  // Basket / hoop
+  drawPixelRect(310, 68, 20, 3, COL.backboard);
+  drawPixelCircle(BASKET.x, BASKET.y - 6, 5, COL.rim);
+  drawPixelRing(BASKET.x, BASKET.y - 6, 7, COL.rim, 2);
+  // Net lines
+  ctx.strokeStyle = COL.net;
+  ctx.lineWidth = px(1);
+  for (let i = -2; i <= 2; i++) {
+    ctx.beginPath();
+    ctx.moveTo(px(BASKET.x + i * 3), px(BASKET.y - 1));
+    ctx.lineTo(px(BASKET.x + i * 4), px(BASKET.y + 10));
+    ctx.stroke();
+  }
+
+  // Center court logo
+  drawPixelText('ACS', 320, 280, 18, 'rgba(255,255,255,0.08)');
+
+  // Court border
+  ctx.strokeStyle = COL.courtLine;
+  ctx.lineWidth = px(2);
+  ctx.strokeRect(px(40), px(40), px(560), px(350));
+}
+
+// ---- DRAW RACKS ----
+function drawRacks() {
+  RACKS.forEach((rack, ri) => {
+    const active = ri === currentRack && (state === STATE.AIMING || state === STATE.SHOOTING);
+    const past = ri < currentRack;
+
+    // Rack stand (small triangle/platform)
+    if (!past || state === STATE.GAMEOVER || state === STATE.RESULT) {
+      drawPixelRect(rack.x - 15, rack.y + 8, 30, 4, active ? COL.red : COL.darkGray);
+    }
+
+    // Draw balls on rack
+    for (let b = 0; b < 5; b++) {
+      const result = rackResults[ri] ? rackResults[ri][b] : null;
+      const bx = rack.x - 12 + b * 6;
+      const by = rack.y + 4;
+
+      if (result === null && (ri > currentRack || (ri === currentRack && b >= currentBall))) {
+        // Unshot ball
+        const isMB = isMoneyBall(b);
+        drawPixelCircle(bx, by, 3, isMB ? COL.gold : COL.ball);
+      } else if (result === 'hit') {
+        drawPixelCircle(bx, by, 3, COL.green);
+      } else if (result === 'miss') {
+        drawPixelCircle(bx, by, 2, COL.darkGray);
+        // X
+        ctx.strokeStyle = COL.red;
+        ctx.lineWidth = px(1);
+        ctx.beginPath();
+        ctx.moveTo(px(bx - 2), px(by - 2));
+        ctx.lineTo(px(bx + 2), px(by + 2));
+        ctx.moveTo(px(bx + 2), px(by - 2));
+        ctx.lineTo(px(bx - 2), px(by + 2));
+        ctx.stroke();
+      }
+    }
+
+    // Rack label
+    if (active) {
+      drawPixelText(rack.label, rack.x, rack.y + 22, 6, COL.white);
+    }
+  });
+}
+
+// ---- DRAW PLAYER ----
+function drawPlayer() {
+  if (state !== STATE.AIMING && state !== STATE.SHOOTING) return;
+  const rack = RACKS[currentRack];
+  const px_ = rack.x;
+  const py_ = rack.y - 10;
+
+  // Shadow
+  drawPixelCircle(px_, py_ + 18, 6, COL.shadow);
+
+  // Body (simple retro sprite)
+  // Legs
+  drawPixelRect(px_ - 4, py_ + 6, 3, 10, COL.red);
+  drawPixelRect(px_ + 1, py_ + 6, 3, 10, COL.red);
+  // Shoes
+  drawPixelRect(px_ - 5, py_ + 14, 5, 3, COL.black);
+  drawPixelRect(px_ + 0, py_ + 14, 5, 3, COL.black);
+  // Torso
+  drawPixelRect(px_ - 5, py_ - 4, 10, 10, COL.red);
+  // Jersey number
+  drawPixelText('3', px_, py_ + 2, 5, COL.white);
+  // Head
+  drawPixelCircle(px_, py_ - 8, 5, '#D2915A');
+  // Hair
+  drawPixelRect(px_ - 4, py_ - 13, 8, 3, COL.black);
+
+  // Arms — raised if shooting
+  if (state === STATE.SHOOTING) {
+    drawPixelRect(px_ - 7, py_ - 8, 3, 6, '#D2915A');
+    drawPixelRect(px_ + 4, py_ - 12, 3, 8, '#D2915A');
+    // Ball in hand (if early in animation)
+    if (ballAnim && ballAnim.t < ballAnim.duration * 0.2) {
+      drawPixelCircle(px_ + 5, py_ - 15, 4, isMoneyBall(currentBall) ? COL.gold : COL.ball);
+    }
+  } else {
+    // Arms at sides / holding ball
+    drawPixelRect(px_ - 8, py_ - 2, 3, 8, '#D2915A');
+    drawPixelRect(px_ + 5, py_ - 2, 3, 8, '#D2915A');
+    // Ball
+    drawPixelCircle(px_ + 7, py_ + 2, 4, isMoneyBall(currentBall) ? COL.gold : COL.ball);
+  }
+}
+
+// ---- DRAW BALL FLIGHT ----
+function drawBallFlight() {
+  if (!ballAnim) return;
+  const { sx, sy, tx, ty, t, duration, peakY } = ballAnim;
+  const p = Math.min(t / duration, 1);
+
+  // Parabolic arc
+  const bx = sx + (tx - sx) * p;
+  const by = sy + (peakY - sy) * 2 * p * (1 - p) + (ty - sy) * p * p + (sy - sy) * (1 - p) * (1 - p);
+  // Simplified: quadratic bezier
+  const midY = peakY;
+  const oneMinusP = 1 - p;
+  const ballY = oneMinusP * oneMinusP * sy + 2 * oneMinusP * p * midY + p * p * ty;
+  const ballX = bx;
+
+  // Ball shadow
+  const shadowY = sy + (ty + 15 - sy) * p;
+  const shadowSize = 2 + (1 - Math.abs(p - 0.5) * 2) * 2;
+  drawPixelCircle(ballX, shadowY, shadowSize, COL.shadow);
+
+  // Ball
+  const isMB = isMoneyBall(currentBall);
+  const r = 4 + (1 - Math.abs(p - 0.5) * 2) * 2;
+  drawPixelCircle(ballX, ballY, r, isMB ? COL.gold : COL.ball);
+  drawPixelCircle(ballX - 1, ballY - 1, r * 0.4, isMB ? '#FFE44D' : COL.ballDark);
+}
+
+// ---- DRAW TIMING METER ----
+function drawMeter() {
+  if (state !== STATE.AIMING) return;
+  const mx = 560, my = 420, mr = 30;
+
+  // Background
+  drawPixelCircle(mx, my, mr + 4, COL.black);
+  drawPixelRing(mx, my, mr + 4, COL.white, 2);
+
+  // Zones — draw as arcs
+  // Miss zone (full circle, dark)
+  ctx.fillStyle = COL.darkGray;
+  ctx.beginPath();
+  ctx.arc(px(mx), px(my), px(mr), 0, Math.PI * 2);
+  ctx.fill();
+
+  // Good zone
+  ctx.fillStyle = '#886600';
+  ctx.beginPath();
+  ctx.arc(px(mx), px(my), px(mr), sweetSpotCenter - goodZoneHalf, sweetSpotCenter + goodZoneHalf);
+  ctx.lineTo(px(mx), px(my));
+  ctx.fill();
+
+  // Sweet spot
+  ctx.fillStyle = COL.green;
+  ctx.beginPath();
+  ctx.arc(px(mx), px(my), px(mr), sweetSpotCenter - sweetSpotHalf, sweetSpotCenter + sweetSpotHalf);
+  ctx.lineTo(px(mx), px(my));
+  ctx.fill();
+
+  // Center dot
+  drawPixelCircle(mx, my, 4, COL.black);
+
+  // Needle
+  const nx = mx + Math.cos(meterAngle) * (mr - 2);
+  const ny = my + Math.sin(meterAngle) * (mr - 2);
+  ctx.strokeStyle = COL.white;
+  ctx.lineWidth = px(3);
+  ctx.beginPath();
+  ctx.moveTo(px(mx), px(my));
+  ctx.lineTo(px(nx), px(ny));
+  ctx.stroke();
+
+  // Needle tip
+  drawPixelCircle(nx, ny, 3, COL.red);
+
+  // Label
+  drawPixelText('TAP!', mx, my - mr - 12, 6, COL.white);
+}
+
+// ---- DRAW HUD ----
+function drawHUD() {
+  if (state < STATE.AIMING && state !== STATE.GAMEOVER) return;
+
+  // Top bar
+  drawPixelRect(0, 0, BASE_W, 36, COL.hud);
+  drawPixelRect(0, 36, BASE_W, 2, COL.red);
+
+  // Score
+  drawPixelText('SCORE', 80, 12, 6, COL.gray);
+  drawPixelText(String(score), 80, 26, 10, COL.white);
+
+  // Timer
+  const timerColor = timeLeft <= 10 ? COL.red : COL.white;
+  drawPixelText('TIME', 320, 12, 6, COL.gray);
+  drawPixelText(timeLeft.toFixed(1), 320, 26, 10, timerColor);
+
+  // Rack / Ball info
+  const rackNum = Math.min(currentRack + 1, 5);
+  const ballNum = Math.min(currentBall + 1, 5);
+  drawPixelText('RACK ' + rackNum + '/5', 530, 12, 6, COL.gray);
+  drawPixelText('BALL ' + ballNum + '/5', 530, 26, 6, COL.gray);
+
+  // Bottom rack score display
+  drawPixelRect(0, 395, BASE_W, 85, COL.hud);
+  drawPixelRect(0, 395, BASE_W, 2, COL.red);
+
+  RACKS.forEach((rack, ri) => {
+    const bx = 68 + ri * 128;
+    const by = 430;
+    const active = ri === currentRack;
+
+    drawPixelText(rack.label, bx, 412, 5, active ? COL.white : COL.gray);
+
+    // Ball indicators
+    for (let b = 0; b < 5; b++) {
+      const result = rackResults[ri] ? rackResults[ri][b] : null;
+      const dotX = bx - 16 + b * 8;
+      const dotY = by;
+      const isMB = isMoneyBall(b);
+
+      if (result === 'hit') {
+        drawPixelCircle(dotX, dotY, 3, isMB ? COL.gold : COL.green);
+      } else if (result === 'miss') {
+        drawPixelCircle(dotX, dotY, 2, COL.darkGray);
+      } else {
+        drawPixelRing(dotX, dotY, 3, isMB ? COL.gold : COL.gray, 1);
+      }
+    }
+
+    // Rack subtotal
+    if (rackResults[ri]) {
+      const sub = rackResults[ri].reduce((s, r, i) => {
+        if (r === 'hit') return s + (isMoneyBall(i) ? 2 : 1);
+        return s;
+      }, 0);
+      if (ri <= currentRack) {
+        drawPixelText(String(sub), bx, by + 14, 7, COL.white);
+      }
+    }
+  });
+}
+
+// ---- DRAW FLASH MESSAGE ----
+function drawFlash() {
+  if (flashTimer <= 0) return;
+  const alpha = Math.min(flashTimer * 2, 1);
+  ctx.globalAlpha = alpha;
+  drawPixelText(flashMsg, 320, 360, 10, flashColor);
+  ctx.globalAlpha = 1;
+}
+
+// ---- DRAW PARTICLES ----
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.globalAlpha = Math.max(0, p.life);
+    drawPixelCircle(p.x, p.y, p.size, p.color);
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ---- DRAW TITLE SCREEN ----
+function drawTitle() {
+  drawPixelRect(0, 0, BASE_W, BASE_H, COL.black);
+
+  // Logo area
+  drawPixelRect(120, 60, 400, 100, COL.red);
+  drawPixelRect(124, 64, 392, 92, COL.black);
+
+  // Decorative lines
+  drawPixelRect(120, 56, 400, 3, COL.white);
+  drawPixelRect(120, 161, 400, 3, COL.white);
+
+  drawPixelText('ACS', 320, 95, 24, COL.red);
+  drawPixelText('SHOOTOUT', 320, 130, 14, COL.white);
+
+  // Basketball icon
+  drawPixelCircle(320, 210, 20, COL.ball);
+  drawPixelRing(320, 210, 20, COL.ballDark, 2);
+  // Ball lines
+  ctx.strokeStyle = COL.ballDark;
+  ctx.lineWidth = px(1.5);
+  ctx.beginPath();
+  ctx.moveTo(px(300), px(210));
+  ctx.lineTo(px(340), px(210));
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(px(320), px(210), px(14), -0.8, 0.8);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(px(320), px(210), px(14), Math.PI - 0.8, Math.PI + 0.8);
+  ctx.stroke();
+
+  // Description
+  drawPixelText('3-POINT CONTEST', 320, 260, 8, COL.gray);
+  drawPixelText('5 RACKS \u2022 5 BALLS \u2022 60 SEC', 320, 280, 6, COL.gray);
+  drawPixelText('LAST BALL = MONEY BALL (2 PTS)', 320, 298, 5, COL.gold);
+
+  // Blink prompt
+  if (Math.floor(titleBlink * 2.5) % 2 === 0) {
+    drawPixelText('TAP OR PRESS SPACE TO START', 320, 350, 7, COL.white);
+  }
+
+  // High score
+  if (leaderboard.length > 0) {
+    drawPixelText('HIGH SCORE: ' + leaderboard[0].score + ' (' + leaderboard[0].name + ')', 320, 400, 6, COL.gold);
+  }
+
+  // Footer
+  drawPixelText('\u00A9 ACS SHOOTOUT', 320, 450, 5, COL.darkGray);
+}
+
+// ---- DRAW READY SCREEN ----
+function drawReady() {
+  drawCourt();
+  drawRacks();
+  drawHUD();
+
+  // Overlay
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawPixelRect(170, 150, 300, 140, COL.black);
+  drawPixelRect(170, 150, 300, 3, COL.red);
+  drawPixelRect(170, 287, 300, 3, COL.red);
+
+  drawPixelText('GET READY!', 320, 185, 12, COL.white);
+  drawPixelText('TAP TO SHOOT', 320, 215, 7, COL.red);
+  drawPixelText('HIT THE GREEN ZONE', 320, 235, 6, COL.green);
+  drawPixelText('FOR PERFECT SHOTS', 320, 252, 6, COL.green);
+
+  if (Math.floor(stateTimer * 3) % 2 === 0) {
+    drawPixelText('TAP TO BEGIN', 320, 275, 6, COL.white);
+  }
+}
+
+// ---- DRAW GAME OVER ----
+function drawGameOver() {
+  drawCourt();
+  drawRacks();
+  drawHUD();
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawPixelRect(140, 100, 360, 220, COL.black);
+  drawPixelRect(140, 100, 360, 3, COL.red);
+  drawPixelRect(140, 317, 360, 3, COL.red);
+
+  drawPixelText('FINAL SCORE', 320, 135, 10, COL.gray);
+  drawPixelText(String(score), 320, 175, 24, COL.white);
+
+  // Max possible = 30
+  const pct = Math.round((score / 30) * 100);
+  drawPixelText(pct + '% SHOOTING', 320, 210, 6, COL.gray);
+
+  // Rack breakdown
+  let totalMade = 0, totalShot = 0;
+  rackResults.forEach((rack, ri) => {
+    rack.forEach((r, bi) => {
+      if (r !== null) totalShot++;
+      if (r === 'hit') totalMade++;
+    });
+  });
+  drawPixelText(totalMade + '/' + totalShot + ' MADE', 320, 232, 7, COL.green);
+
+  // Rating
+  let rating = 'ROOKIE';
+  if (score >= 25) rating = 'LEGENDARY!';
+  else if (score >= 20) rating = 'ALL-STAR!';
+  else if (score >= 15) rating = 'SHARPSHOOTER';
+  else if (score >= 10) rating = 'STARTER';
+  else if (score >= 5) rating = 'BENCH PLAYER';
+  drawPixelText(rating, 320, 260, 8, score >= 20 ? COL.gold : COL.white);
+
+  if (isHighScore(score)) {
+    drawPixelText('NEW HIGH SCORE!', 320, 285, 7, COL.gold);
+  }
+
+  if (stateTimer > 1.5 && Math.floor(stateTimer * 3) % 2 === 0) {
+    drawPixelText('TAP TO CONTINUE', 320, 305, 6, COL.white);
+  }
+}
+
+// ---- DRAW INITIALS ENTRY ----
+function drawInitials() {
+  drawPixelRect(0, 0, BASE_W, BASE_H, COL.black);
+
+  drawPixelText('NEW HIGH SCORE!', 320, 60, 10, COL.gold);
+  drawPixelText(String(pendingScore), 320, 95, 18, COL.white);
+
+  drawPixelText('ENTER YOUR INITIALS', 320, 150, 7, COL.gray);
+
+  // Letter boxes
+  for (let i = 0; i < 3; i++) {
+    const bx = 260 + i * 40;
+    const by = 200;
+    const active = i === initialsPos;
+
+    drawPixelRect(bx - 15, by - 18, 30, 36, active ? COL.red : COL.darkGray);
+    drawPixelRect(bx - 13, by - 16, 26, 32, COL.black);
+
+    // Letter
+    const blink = active && Math.floor(stateTimer * 4) % 2 === 0;
+    if (!blink) {
+      drawPixelText(initialsEntry[i], bx, by, 16, active ? COL.white : COL.gray);
+    }
+
+    // Arrows
+    if (active) {
+      drawPixelText('\u25B2', bx, by - 28, 6, COL.white);
+      drawPixelText('\u25BC', bx, by + 28, 6, COL.white);
+    }
+  }
+
+  drawPixelText('USE ARROWS OR TYPE LETTERS', 320, 280, 5, COL.gray);
+  drawPixelText('TAP / ENTER TO CONFIRM', 320, 300, 5, COL.gray);
+
+  // Keyboard hint
+  drawPixelText('[A-Z]  \u2190 \u2191 \u2192 \u2193  ENTER', 320, 340, 5, COL.darkGray);
+}
+
+// ---- DRAW LEADERBOARD ----
+function drawLeaderboard() {
+  drawPixelRect(0, 0, BASE_W, BASE_H, COL.black);
+
+  drawPixelRect(100, 20, 440, 3, COL.red);
+  drawPixelText('LEADERBOARD', 320, 45, 12, COL.white);
+  drawPixelRect(100, 60, 440, 3, COL.red);
+
+  drawPixelText('RANK', 160, 85, 6, COL.gray);
+  drawPixelText('NAME', 320, 85, 6, COL.gray);
+  drawPixelText('SCORE', 470, 85, 6, COL.gray);
+
+  const colors = [COL.gold, '#C0C0C0', '#CD7F32'];
+  for (let i = 0; i < Math.min(leaderboard.length, 10); i++) {
+    const entry = leaderboard[i];
+    const y = 115 + i * 28;
+    const color = i < 3 ? colors[i] : COL.white;
+    const isNew = entry.score === pendingScore && entry.name === initialsEntry.join('');
+
+    drawPixelText(String(i + 1) + '.', 160, y, 7, color);
+    drawPixelText(entry.name, 320, y, 7, isNew ? COL.red : color);
+    drawPixelText(String(entry.score), 470, y, 7, color);
+  }
+
+  if (leaderboard.length === 0) {
+    drawPixelText('NO SCORES YET', 320, 200, 7, COL.gray);
+    drawPixelText('BE THE FIRST!', 320, 225, 7, COL.gray);
+  }
+
+  drawPixelRect(100, 410, 440, 3, COL.red);
+  if (Math.floor(stateTimer * 2.5) % 2 === 0) {
+    drawPixelText('TAP TO PLAY AGAIN', 320, 440, 7, COL.white);
+  }
+}
+
+// ---- MAIN DRAW ----
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  switch (state) {
+    case STATE.TITLE:
+      drawTitle();
+      break;
+    case STATE.READY:
+      drawReady();
+      break;
+    case STATE.AIMING:
+    case STATE.SHOOTING:
+      drawCourt();
+      drawRacks();
+      drawPlayer();
+      drawBallFlight();
+      drawMeter();
+      drawHUD();
+      drawFlash();
+      drawParticles();
+      break;
+    case STATE.GAMEOVER:
+      drawGameOver();
+      drawParticles();
+      break;
+    case STATE.INITIALS:
+      drawInitials();
+      break;
+    case STATE.LEADERBOARD:
+      drawLeaderboard();
+      break;
+  }
+}
+
+// ---- GAME LOOP ----
+let prevTimestamp = 0;
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - prevTimestamp) / 1000, 0.05);
+  prevTimestamp = timestamp;
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
