@@ -106,12 +106,21 @@ const GAME_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="preload" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" as="style">
 <title>ACS 3-Point Shooter</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * {
+    margin: 0; padding: 0; box-sizing: border-box;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
 
   body {
     background: #111;
@@ -119,9 +128,16 @@ const GAME_HTML = `<!DOCTYPE html>
     justify-content: center;
     align-items: center;
     min-height: 100vh;
+    min-height: -webkit-fill-available;
     font-family: 'Press Start 2P', monospace;
     overflow: hidden;
+    overscroll-behavior: none;
     image-rendering: pixelated;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  html {
+    height: -webkit-fill-available;
   }
 
   canvas {
@@ -144,15 +160,27 @@ const ctx = canvas.getContext('2d');
 // Responsive sizing
 const BASE_W = 640, BASE_H = 480;
 let scale = 1;
+let dpr = 1;
 function resize() {
-  scale = Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H);
+  dpr = window.devicePixelRatio || 1;
+  const availW = window.innerWidth;
+  const availH = window.innerHeight;
+  scale = Math.min(availW / BASE_W, availH / BASE_H);
   scale = Math.max(1, Math.floor(scale)) || 1;
-  canvas.width = BASE_W * scale;
-  canvas.height = BASE_H * scale;
+  canvas.style.width = (BASE_W * scale) + 'px';
+  canvas.style.height = (BASE_H * scale) + 'px';
+  canvas.width = BASE_W * scale * dpr;
+  canvas.height = BASE_H * scale * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.imageSmoothingEnabled = false;
 }
 resize();
 window.addEventListener('resize', resize);
+
+// Attempt landscape lock (ignored on desktop/unsupported browsers)
+if (screen.orientation && screen.orientation.lock) {
+  screen.orientation.lock('landscape').catch(() => {});
+}
 
 // ---- COLORS ----
 const COL = {
@@ -180,6 +208,7 @@ const COL = {
 let audioCtx;
 function ensureAudio() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
 }
 function playTone(freq, dur, type = 'square', vol = 0.1) {
   ensureAudio();
