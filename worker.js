@@ -1,4 +1,4 @@
-// ACS Shootout — Cloudflare Worker
+// ACS 3-Point Shooter — Cloudflare Worker
 // Serves the game HTML at / and leaderboard API at /api/leaderboard
 
 const CORS_HEADERS = {
@@ -107,7 +107,7 @@ const GAME_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ACS Shootout</title>
+<title>ACS 3-Point Shooter</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
 
@@ -135,7 +135,7 @@ const GAME_HTML = `<!DOCTYPE html>
 <canvas id="game"></canvas>
 <script>
 // ============================================================
-//  ACS SHOOTOUT \u2014 Retro 3-Point Contest
+//  ACS 3-POINT SHOOTER \u2014 Retro 3-Point Contest
 // ============================================================
 
 const canvas = document.getElementById('game');
@@ -995,8 +995,9 @@ function drawTitle() {
   drawPixelRect(120, 56, 400, 3, COL.white);
   drawPixelRect(120, 161, 400, 3, COL.white);
 
-  drawPixelText('ACS', 320, 95, 24, COL.red);
-  drawPixelText('SHOOTOUT', 320, 130, 14, COL.white);
+  drawPixelText('ACS', 320, 90, 20, COL.red);
+  drawPixelText('3-POINT', 320, 118, 14, COL.white);
+  drawPixelText('SHOOTER', 320, 140, 14, COL.white);
 
   // Basketball icon
   drawPixelCircle(320, 210, 20, COL.ball);
@@ -1031,7 +1032,7 @@ function drawTitle() {
   }
 
   // Footer
-  drawPixelText('\u00A9 ACS SHOOTOUT', 320, 450, 5, COL.darkGray);
+  drawPixelText('\u00A9 ACS 3-POINT SHOOTER', 320, 450, 5, COL.darkGray);
 }
 
 // ---- DRAW READY SCREEN ----
